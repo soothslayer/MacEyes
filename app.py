@@ -3,10 +3,14 @@
 
 import anthropic
 import base64
+import math
 import os
+import struct
 import subprocess
+import sys
 import tempfile
 import threading
+import traceback
 
 import Quartz
 import pyautogui
@@ -99,6 +103,7 @@ class MacEyesApp(rumps.App):
             self._say_proc = _speak_async(desc)
             self._say_proc.wait()
         except Exception as exc:
+            traceback.print_exc(file=sys.stderr)
             rumps.notification("MacEyes", "Error", str(exc))
         finally:
             self._busy = False
@@ -114,7 +119,12 @@ class MacEyesApp(rumps.App):
             self._say_proc = _speak_async(f"Got it. {command}. Working on it.")
             self._say_proc.wait()
 
-            result = _run_computer_use(command)
+            tones = _WorkingTones()
+            tones.start()
+            try:
+                result = _run_computer_use(command)
+            finally:
+                tones.stop()
 
             self._say_proc = _speak_async(result)
             self._say_proc.wait()
@@ -123,10 +133,68 @@ class MacEyesApp(rumps.App):
         except sr.UnknownValueError:
             _speak_async("Sorry, I couldn't understand that. Please try again.").wait()
         except Exception as exc:
+            traceback.print_exc(file=sys.stderr)
             rumps.notification("MacEyes", "Voice Action Error", str(exc))
         finally:
             self._busy = False
             self.title = "👁"
+
+
+class _WorkingTones:
+    """Plays soft repeating tones in the background while Claude is working.
+
+    A short sine-wave pulse (220 Hz, ~120 ms) fires every 3 seconds at low
+    volume so the user knows processing is still in progress.
+    """
+
+    _SAMPLE_RATE = 44100
+    _FREQ = 220          # Hz — low A, unobtrusive
+    _DURATION = 0.12     # seconds per pulse
+    _INTERVAL = 3.0      # seconds between pulses
+    _VOLUME = 0.08       # 0.0–1.0
+
+    def __init__(self):
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join(timeout=2)
+
+    def _loop(self):
+        try:
+            import pyaudio
+            pa = pyaudio.PyAudio()
+            stream = pa.open(
+                format=pyaudio.paInt16,
+                channels=1,
+                rate=self._SAMPLE_RATE,
+                output=True,
+            )
+            try:
+                while not self._stop.wait(timeout=self._INTERVAL):
+                    stream.write(self._make_pulse())
+            finally:
+                stream.stop_stream()
+                stream.close()
+                pa.terminate()
+        except Exception:
+            pass  # never let tone errors surface to the user
+
+    def _make_pulse(self) -> bytes:
+        n = int(self._SAMPLE_RATE * self._DURATION)
+        frames = []
+        for i in range(n):
+            # sine wave with a simple linear fade-in/out envelope
+            t = i / self._SAMPLE_RATE
+            envelope = min(i, n - i) / (n * 0.15)
+            envelope = min(envelope, 1.0)
+            sample = self._VOLUME * envelope * math.sin(2 * math.pi * self._FREQ * t)
+            frames.append(struct.pack("<h", int(sample * 32767)))
+        return b"".join(frames)
 
 
 def _listen_for_command() -> str:
@@ -238,7 +306,7 @@ def _run_computer_use(request: str) -> str:
 
     for _ in range(20):  # safety cap on iterations
         response = client.beta.messages.create(
-            model="claude-opus-4-6",
+            model="claude-sonnet-4-5",
             max_tokens=4096,
             system=VOICE_ACTION_SYSTEM,
             tools=tools,
