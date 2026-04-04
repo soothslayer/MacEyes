@@ -46,6 +46,7 @@ VOICE_ACTION_SYSTEM = (
 
 _SETTINGS_PATH = os.path.expanduser("~/.maceyes.json")
 _DEFAULT_STOP_HOTKEY = "cmd+."
+_DEFAULT_VOICE_ACTION_HOTKEY = "cmd+shift+v"
 
 
 class _Settings:
@@ -74,6 +75,16 @@ class _Settings:
     @stop_hotkey.setter
     def stop_hotkey(self, value: str):
         self._data["stop_hotkey"] = value
+        self._save()
+
+    @property
+    def voice_action_hotkey(self) -> str:
+        """Human-readable hotkey string, e.g. 'cmd+shift+v'"""
+        return self._data.get("voice_action_hotkey", _DEFAULT_VOICE_ACTION_HOTKEY)
+
+    @voice_action_hotkey.setter
+    def voice_action_hotkey(self, value: str):
+        self._data["voice_action_hotkey"] = value
         self._save()
 
 
@@ -127,10 +138,14 @@ class MacEyesApp(rumps.App):
         self._settings = _Settings()
 
         settings_menu = rumps.MenuItem("Settings")
-        self._hotkey_item = rumps.MenuItem(
-            self._hotkey_menu_label(), callback=self.on_set_hotkey
+        self._stop_hotkey_item = rumps.MenuItem(
+            self._stop_hotkey_menu_label(), callback=self.on_set_stop_hotkey
         )
-        settings_menu.add(self._hotkey_item)
+        self._voice_hotkey_item = rumps.MenuItem(
+            self._voice_hotkey_menu_label(), callback=self.on_set_voice_hotkey
+        )
+        settings_menu.add(self._stop_hotkey_item)
+        settings_menu.add(self._voice_hotkey_item)
 
         self.menu = [
             rumps.MenuItem("Describe Screen", callback=self.on_describe),
@@ -144,9 +159,7 @@ class MacEyesApp(rumps.App):
         self._say_proc: subprocess.Popen | None = None
         self._cancel = threading.Event()
 
-        self._hotkey_listener = keyboard.GlobalHotKeys(
-            {_hotkey_to_pynput(self._settings.stop_hotkey): self._on_stop_hotkey}
-        )
+        self._hotkey_listener = self._build_hotkey_listener()
         self._hotkey_listener.start()
 
     @rumps.clicked("Describe Screen")
@@ -183,42 +196,68 @@ class MacEyesApp(rumps.App):
         if self._say_proc and self._say_proc.poll() is None:
             self._say_proc.terminate()
 
-    def _hotkey_menu_label(self) -> str:
+    def _on_voice_action_hotkey(self):
+        """Trigger Voice Action from the global hotkey."""
+        self.on_voice_action(None)
+
+    def _build_hotkey_listener(self) -> keyboard.GlobalHotKeys:
+        """Build a fresh GlobalHotKeys listener with the current settings."""
+        return keyboard.GlobalHotKeys({
+            _hotkey_to_pynput(self._settings.stop_hotkey): self._on_stop_hotkey,
+            _hotkey_to_pynput(self._settings.voice_action_hotkey): self._on_voice_action_hotkey,
+        })
+
+    def _stop_hotkey_menu_label(self) -> str:
         return f"Stop Hotkey: {self._settings.stop_hotkey}"
 
-    def on_set_hotkey(self, _):
+    def _voice_hotkey_menu_label(self) -> str:
+        return f"Voice Action Hotkey: {self._settings.voice_action_hotkey}"
+
+    def _prompt_hotkey(self, title: str, current: str) -> str | None:
+        """Show a dialog to enter a new hotkey. Returns the new value or None if cancelled."""
         window = rumps.Window(
-            message="Enter a new stop hotkey.\nUse modifier names: cmd, ctrl, shift, alt\nExample: cmd+.  or  ctrl+shift+x",
-            title="Set Stop Hotkey",
-            default_text=self._settings.stop_hotkey,
+            message="Use modifier names: cmd, ctrl, shift, alt\nExample: cmd+shift+v  or  ctrl+shift+x",
+            title=title,
+            default_text=current,
             ok="Save",
             cancel="Cancel",
             dimensions=(260, 24),
         )
         response = window.run()
         if not response.clicked:
-            return
+            return None
 
         new_hotkey = response.text.strip().lower()
         if not new_hotkey:
-            return
+            return None
 
         try:
-            pynput_str = _hotkey_to_pynput(new_hotkey)
-            # Validate by attempting to parse it
-            keyboard.HotKey.parse(pynput_str)
+            keyboard.HotKey.parse(_hotkey_to_pynput(new_hotkey))
         except Exception as exc:
             rumps.alert(title="Invalid Hotkey", message=str(exc))
-            return
+            return None
 
-        # Stop old listener, start new one
+        return new_hotkey
+
+    def on_set_stop_hotkey(self, _):
+        new_hotkey = self._prompt_hotkey("Set Stop Hotkey", self._settings.stop_hotkey)
+        if new_hotkey is None:
+            return
         self._hotkey_listener.stop()
         self._settings.stop_hotkey = new_hotkey
-        self._hotkey_listener = keyboard.GlobalHotKeys(
-            {pynput_str: self._on_stop_hotkey}
-        )
+        self._hotkey_listener = self._build_hotkey_listener()
         self._hotkey_listener.start()
-        self._hotkey_item.title = self._hotkey_menu_label()
+        self._stop_hotkey_item.title = self._stop_hotkey_menu_label()
+
+    def on_set_voice_hotkey(self, _):
+        new_hotkey = self._prompt_hotkey("Set Voice Action Hotkey", self._settings.voice_action_hotkey)
+        if new_hotkey is None:
+            return
+        self._hotkey_listener.stop()
+        self._settings.voice_action_hotkey = new_hotkey
+        self._hotkey_listener = self._build_hotkey_listener()
+        self._hotkey_listener.start()
+        self._voice_hotkey_item.title = self._voice_hotkey_menu_label()
 
     def _run(self, capture_fn=None):
         self._cancel.clear()
