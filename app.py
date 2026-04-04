@@ -3,6 +3,7 @@
 
 import anthropic
 import base64
+import json
 import math
 import os
 import struct
@@ -16,6 +17,7 @@ import Quartz
 import pyautogui
 import rumps
 import speech_recognition as sr
+from pynput import keyboard
 
 pyautogui.PAUSE = 0.1
 pyautogui.FAILSAFE = False
@@ -42,6 +44,71 @@ VOICE_ACTION_SYSTEM = (
     "When done, provide a brief, spoken-friendly summary (1-2 sentences) of what you did."
 )
 
+_SETTINGS_PATH = os.path.expanduser("~/.maceyes.json")
+_DEFAULT_STOP_HOTKEY = "cmd+."
+
+
+class _Settings:
+    """Persists user preferences to ~/.maceyes.json."""
+
+    def __init__(self):
+        self._data: dict = {}
+        self._load()
+
+    def _load(self):
+        try:
+            with open(_SETTINGS_PATH) as f:
+                self._data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            self._data = {}
+
+    def _save(self):
+        with open(_SETTINGS_PATH, "w") as f:
+            json.dump(self._data, f, indent=2)
+
+    @property
+    def stop_hotkey(self) -> str:
+        """Human-readable hotkey string, e.g. 'cmd+.'"""
+        return self._data.get("stop_hotkey", _DEFAULT_STOP_HOTKEY)
+
+    @stop_hotkey.setter
+    def stop_hotkey(self, value: str):
+        self._data["stop_hotkey"] = value
+        self._save()
+
+
+_KEY_ALIASES = {
+    "option": "alt",
+    "escape": "esc",
+    "return": "enter",
+    "delete": "backspace",
+}
+
+
+def _hotkey_to_pynput(hotkey: str) -> str:
+    """Convert a user-friendly hotkey string to pynput GlobalHotKeys format.
+
+    Modifiers (cmd, ctrl, shift, alt/option) and multi-character key names
+    (esc, space, enter, tab, f1-f12, etc.) are wrapped in <>.
+    Single printable characters are left bare.
+
+    Examples:
+        'cmd+.'        -> '<cmd>+.'
+        'ctrl+shift+s' -> '<ctrl>+<shift>+s'
+        'cmd+escape'   -> '<cmd>+<esc>'
+    """
+    modifiers = {"cmd", "ctrl", "shift", "alt"}
+    parts = [p.strip().lower() for p in hotkey.split("+")]
+    converted = []
+    for part in parts:
+        part = _KEY_ALIASES.get(part, part)
+        if part in modifiers or len(part) > 1:
+            converted.append(f"<{part}>")
+        else:
+            converted.append(part)
+    return "+".join(converted)
+
+
 # Key name mapping from X11/Claude style to pyautogui style
 _KEY_MAP = {
     "Return": "enter", "Escape": "esc", "BackSpace": "backspace",
@@ -57,14 +124,30 @@ _KEY_MAP = {
 class MacEyesApp(rumps.App):
     def __init__(self):
         super().__init__("👁", quit_button="Quit MacEyes")
+        self._settings = _Settings()
+
+        settings_menu = rumps.MenuItem("Settings")
+        self._hotkey_item = rumps.MenuItem(
+            self._hotkey_menu_label(), callback=self.on_set_hotkey
+        )
+        settings_menu.add(self._hotkey_item)
+
         self.menu = [
             rumps.MenuItem("Describe Screen", callback=self.on_describe),
             rumps.MenuItem("Describe Active Window", callback=self.on_describe_window),
             rumps.MenuItem("Voice Action", callback=self.on_voice_action),
             rumps.MenuItem("Stop Speaking", callback=self.on_stop),
+            None,  # separator
+            settings_menu,
         ]
         self._busy = False
         self._say_proc: subprocess.Popen | None = None
+        self._cancel = threading.Event()
+
+        self._hotkey_listener = keyboard.GlobalHotKeys(
+            {_hotkey_to_pynput(self._settings.stop_hotkey): self._on_stop_hotkey}
+        )
+        self._hotkey_listener.start()
 
     @rumps.clicked("Describe Screen")
     def on_describe(self, _):
@@ -92,10 +175,53 @@ class MacEyesApp(rumps.App):
 
     @rumps.clicked("Stop Speaking")
     def on_stop(self, _):
+        self._on_stop_hotkey()
+
+    def _on_stop_hotkey(self):
+        """Stop speech and cancel any running action."""
+        self._cancel.set()
         if self._say_proc and self._say_proc.poll() is None:
             self._say_proc.terminate()
 
+    def _hotkey_menu_label(self) -> str:
+        return f"Stop Hotkey: {self._settings.stop_hotkey}"
+
+    def on_set_hotkey(self, _):
+        window = rumps.Window(
+            message="Enter a new stop hotkey.\nUse modifier names: cmd, ctrl, shift, alt\nExample: cmd+.  or  ctrl+shift+x",
+            title="Set Stop Hotkey",
+            default_text=self._settings.stop_hotkey,
+            ok="Save",
+            cancel="Cancel",
+            dimensions=(260, 24),
+        )
+        response = window.run()
+        if not response.clicked:
+            return
+
+        new_hotkey = response.text.strip().lower()
+        if not new_hotkey:
+            return
+
+        try:
+            pynput_str = _hotkey_to_pynput(new_hotkey)
+            # Validate by attempting to parse it
+            keyboard.HotKey.parse(pynput_str)
+        except Exception as exc:
+            rumps.alert(title="Invalid Hotkey", message=str(exc))
+            return
+
+        # Stop old listener, start new one
+        self._hotkey_listener.stop()
+        self._settings.stop_hotkey = new_hotkey
+        self._hotkey_listener = keyboard.GlobalHotKeys(
+            {pynput_str: self._on_stop_hotkey}
+        )
+        self._hotkey_listener.start()
+        self._hotkey_item.title = self._hotkey_menu_label()
+
     def _run(self, capture_fn=None):
+        self._cancel.clear()
         try:
             _speak_async("Analyzing screen...").wait()
             img = (capture_fn or _capture_screen)()
@@ -110,6 +236,7 @@ class MacEyesApp(rumps.App):
             self.title = "👁"
 
     def _run_voice_action(self):
+        self._cancel.clear()
         try:
             self._say_proc = _speak_async("Listening. Say your command.")
             self._say_proc.wait()
@@ -122,9 +249,12 @@ class MacEyesApp(rumps.App):
             tones = _WorkingTones()
             tones.start()
             try:
-                result = _run_computer_use(command)
+                result = _run_computer_use(command, self._cancel)
             finally:
                 tones.stop()
+
+            if self._cancel.is_set():
+                return
 
             self._say_proc = _speak_async(result)
             self._say_proc.wait()
@@ -290,7 +420,7 @@ def _execute_bash_tool(command: str) -> str:
         return "Command timed out after 30 seconds."
 
 
-def _run_computer_use(request: str) -> str:
+def _run_computer_use(request: str, cancel: threading.Event | None = None) -> str:
     """Drive a Claude computer-use loop to fulfil the user's spoken request."""
     w, h = _get_screen_size()
     tools = [
@@ -305,6 +435,8 @@ def _run_computer_use(request: str) -> str:
     messages = [{"role": "user", "content": request}]
 
     for _ in range(20):  # safety cap on iterations
+        if cancel and cancel.is_set():
+            return "Cancelled."
         response = client.beta.messages.create(
             model="claude-sonnet-4-5",
             max_tokens=4096,
