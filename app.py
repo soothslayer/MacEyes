@@ -9,7 +9,12 @@ import tempfile
 import threading
 
 import Quartz
+import pyautogui
 import rumps
+import speech_recognition as sr
+
+pyautogui.PAUSE = 0.1
+pyautogui.FAILSAFE = False
 
 client = anthropic.Anthropic()
 
@@ -25,6 +30,25 @@ DESCRIBE_PROMPT = (
     "Be concise and natural — you will be read aloud."
 )
 
+VOICE_ACTION_SYSTEM = (
+    "You are a computer automation assistant. "
+    "The user has spoken a task they want performed on their Mac. "
+    "Use the tools to observe the screen and take actions to complete the task. "
+    "Take a screenshot first to understand the current state. "
+    "When done, provide a brief, spoken-friendly summary (1-2 sentences) of what you did."
+)
+
+# Key name mapping from X11/Claude style to pyautogui style
+_KEY_MAP = {
+    "Return": "enter", "Escape": "esc", "BackSpace": "backspace",
+    "Delete": "delete", "Tab": "tab", "space": "space",
+    "Up": "up", "Down": "down", "Left": "left", "Right": "right",
+    "Home": "home", "End": "end", "Page_Up": "pageup", "Page_Down": "pagedown",
+    "ctrl": "ctrl", "alt": "alt", "shift": "shift",
+    "super": "command", "cmd": "command", "meta": "command",
+    **{f"F{i}": f"f{i}" for i in range(1, 13)},
+}
+
 
 class MacEyesApp(rumps.App):
     def __init__(self):
@@ -32,6 +56,7 @@ class MacEyesApp(rumps.App):
         self.menu = [
             rumps.MenuItem("Describe Screen", callback=self.on_describe),
             rumps.MenuItem("Describe Active Window", callback=self.on_describe_window),
+            rumps.MenuItem("Voice Action", callback=self.on_voice_action),
             rumps.MenuItem("Stop Speaking", callback=self.on_stop),
         ]
         self._busy = False
@@ -53,6 +78,14 @@ class MacEyesApp(rumps.App):
         self.title = "⏳"
         threading.Thread(target=self._run, args=(_capture_active_window,), daemon=True).start()
 
+    @rumps.clicked("Voice Action")
+    def on_voice_action(self, _):
+        if self._busy:
+            return
+        self._busy = True
+        self.title = "🎤"
+        threading.Thread(target=self._run_voice_action, daemon=True).start()
+
     @rumps.clicked("Stop Speaking")
     def on_stop(self, _):
         if self._say_proc and self._say_proc.poll() is None:
@@ -70,6 +103,182 @@ class MacEyesApp(rumps.App):
         finally:
             self._busy = False
             self.title = "👁"
+
+    def _run_voice_action(self):
+        try:
+            self._say_proc = _speak_async("Listening. Say your command.")
+            self._say_proc.wait()
+
+            command = _listen_for_command()
+
+            self._say_proc = _speak_async(f"Got it. {command}. Working on it.")
+            self._say_proc.wait()
+
+            result = _run_computer_use(command)
+
+            self._say_proc = _speak_async(result)
+            self._say_proc.wait()
+        except sr.WaitTimeoutError:
+            _speak_async("No speech detected. Please try again.").wait()
+        except sr.UnknownValueError:
+            _speak_async("Sorry, I couldn't understand that. Please try again.").wait()
+        except Exception as exc:
+            rumps.notification("MacEyes", "Voice Action Error", str(exc))
+        finally:
+            self._busy = False
+            self.title = "👁"
+
+
+def _listen_for_command() -> str:
+    """Record from the microphone and return transcribed text."""
+    recognizer = sr.Recognizer()
+    with sr.Microphone() as source:
+        recognizer.adjust_for_ambient_noise(source, duration=0.5)
+        audio = recognizer.listen(source, timeout=10, phrase_time_limit=15)
+    return recognizer.recognize_google(audio)
+
+
+def _get_screen_size() -> tuple[int, int]:
+    """Return the main display resolution as (width, height)."""
+    display_id = Quartz.CGMainDisplayID()
+    return (
+        Quartz.CGDisplayPixelsWide(display_id),
+        Quartz.CGDisplayPixelsHigh(display_id),
+    )
+
+
+def _execute_computer_tool(action: str, params: dict) -> list | str:
+    """Execute a computer_20250124 tool action and return content for the tool result."""
+    if action == "screenshot":
+        img = _capture_screen()
+        return [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img}}]
+
+    if action in ("left_click", "right_click", "middle_click", "double_click"):
+        x, y = params["coordinate"]
+        btn = {"left_click": "left", "right_click": "right",
+               "middle_click": "middle", "double_click": "left"}[action]
+        pyautogui.click(x, y, button=btn, clicks=2 if action == "double_click" else 1)
+        return "OK"
+
+    if action == "left_click_drag":
+        sx, sy = params["start_coordinate"]
+        ex, ey = params["coordinate"]
+        pyautogui.mouseDown(sx, sy, button="left")
+        pyautogui.moveTo(ex, ey, duration=0.3)
+        pyautogui.mouseUp(button="left")
+        return "OK"
+
+    if action == "mouse_move":
+        x, y = params["coordinate"]
+        pyautogui.moveTo(x, y)
+        return "OK"
+
+    if action == "type":
+        text = params.get("text", "")
+        # Use pbpaste/pbcopy trick for reliable unicode input on macOS
+        proc = subprocess.run(
+            ["osascript", "-e", f'tell application "System Events" to keystroke "{text}"'],
+            capture_output=True,
+        )
+        if proc.returncode != 0:
+            # Fallback for text without special chars
+            pyautogui.write(text, interval=0.02)
+        return "OK"
+
+    if action == "key":
+        raw = params.get("text", "")
+        keys = [_KEY_MAP.get(k, k.lower()) for k in raw.split("+")]
+        pyautogui.hotkey(*keys)
+        return "OK"
+
+    if action == "scroll":
+        x, y = params["coordinate"]
+        direction = params.get("direction", "down")
+        amount = int(params.get("amount", 3))
+        # pyautogui scroll: positive = up, negative = down
+        clicks = amount if direction == "up" else -amount
+        if direction in ("left", "right"):
+            pyautogui.hscroll(clicks if direction == "right" else -clicks, x=x, y=y)
+        else:
+            pyautogui.scroll(clicks, x=x, y=y)
+        return "OK"
+
+    if action == "cursor_position":
+        x, y = pyautogui.position()
+        return f"X={x},Y={y}"
+
+    return f"Unknown action: {action}"
+
+
+def _execute_bash_tool(command: str) -> str:
+    """Run a bash command and return combined stdout+stderr (truncated)."""
+    try:
+        result = subprocess.run(
+            command, shell=True, capture_output=True, text=True, timeout=30
+        )
+        output = (result.stdout + result.stderr).strip()
+        return output[:4000] if output else "(no output)"
+    except subprocess.TimeoutExpired:
+        return "Command timed out after 30 seconds."
+
+
+def _run_computer_use(request: str) -> str:
+    """Drive a Claude computer-use loop to fulfil the user's spoken request."""
+    w, h = _get_screen_size()
+    tools = [
+        {
+            "type": "computer_20250124",
+            "name": "computer",
+            "display_width_px": w,
+            "display_height_px": h,
+        },
+        {"type": "bash_20250124", "name": "bash"},
+    ]
+    messages = [{"role": "user", "content": request}]
+
+    for _ in range(20):  # safety cap on iterations
+        response = client.beta.messages.create(
+            model="claude-opus-4-6",
+            max_tokens=4096,
+            system=VOICE_ACTION_SYSTEM,
+            tools=tools,
+            messages=messages,
+            betas=["computer-use-2025-01-24"],
+        )
+
+        # Append assistant turn (keep raw content blocks for the API)
+        messages.append({"role": "assistant", "content": response.content})
+
+        if response.stop_reason == "end_turn":
+            return next(
+                (b.text for b in response.content if hasattr(b, "text") and b.text),
+                "Task completed.",
+            )
+
+        # Execute all tool calls and collect results
+        tool_results = []
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
+            if block.name == "computer":
+                content = _execute_computer_tool(block.input.get("action", ""), block.input)
+            elif block.name == "bash":
+                content = _execute_bash_tool(block.input.get("command", ""))
+            else:
+                content = f"Unknown tool: {block.name}"
+
+            if isinstance(content, str):
+                content = [{"type": "text", "text": content}]
+
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": content,
+            })
+
+        messages.append({"role": "user", "content": tool_results})
+
+    return "Task loop reached maximum iterations. Stopping."
 
 
 def _capture_screen() -> str:
