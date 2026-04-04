@@ -5,8 +5,10 @@ import anthropic
 import base64
 import os
 import subprocess
+import sys
 import tempfile
 import threading
+import traceback
 
 import Quartz
 import pyautogui
@@ -99,6 +101,7 @@ class MacEyesApp(rumps.App):
             self._say_proc = _speak_async(desc)
             self._say_proc.wait()
         except Exception as exc:
+            traceback.print_exc(file=sys.stderr)
             rumps.notification("MacEyes", "Error", str(exc))
         finally:
             self._busy = False
@@ -123,6 +126,7 @@ class MacEyesApp(rumps.App):
         except sr.UnknownValueError:
             _speak_async("Sorry, I couldn't understand that. Please try again.").wait()
         except Exception as exc:
+            traceback.print_exc(file=sys.stderr)
             rumps.notification("MacEyes", "Voice Action Error", str(exc))
         finally:
             self._busy = False
@@ -238,7 +242,7 @@ def _run_computer_use(request: str) -> str:
 
     for _ in range(20):  # safety cap on iterations
         response = client.beta.messages.create(
-            model="claude-opus-4-6",
+            model="claude-sonnet-4-5",
             max_tokens=4096,
             system=VOICE_ACTION_SYSTEM,
             tools=tools,
