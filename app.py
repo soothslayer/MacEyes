@@ -16,6 +16,7 @@ import Quartz
 import pyautogui
 import rumps
 import speech_recognition as sr
+from pynput import keyboard
 
 pyautogui.PAUSE = 0.1
 pyautogui.FAILSAFE = False
@@ -65,6 +66,13 @@ class MacEyesApp(rumps.App):
         ]
         self._busy = False
         self._say_proc: subprocess.Popen | None = None
+        self._cancel = threading.Event()
+
+        # Global hotkey: Cmd+. stops speech and any running action
+        self._hotkey_listener = keyboard.GlobalHotKeys(
+            {"<cmd>.": self._on_stop_hotkey}
+        )
+        self._hotkey_listener.start()
 
     @rumps.clicked("Describe Screen")
     def on_describe(self, _):
@@ -92,10 +100,16 @@ class MacEyesApp(rumps.App):
 
     @rumps.clicked("Stop Speaking")
     def on_stop(self, _):
+        self._on_stop_hotkey()
+
+    def _on_stop_hotkey(self):
+        """Stop speech and cancel any running action (Cmd+.)."""
+        self._cancel.set()
         if self._say_proc and self._say_proc.poll() is None:
             self._say_proc.terminate()
 
     def _run(self, capture_fn=None):
+        self._cancel.clear()
         try:
             _speak_async("Analyzing screen...").wait()
             img = (capture_fn or _capture_screen)()
@@ -110,6 +124,7 @@ class MacEyesApp(rumps.App):
             self.title = "👁"
 
     def _run_voice_action(self):
+        self._cancel.clear()
         try:
             self._say_proc = _speak_async("Listening. Say your command.")
             self._say_proc.wait()
@@ -122,9 +137,12 @@ class MacEyesApp(rumps.App):
             tones = _WorkingTones()
             tones.start()
             try:
-                result = _run_computer_use(command)
+                result = _run_computer_use(command, self._cancel)
             finally:
                 tones.stop()
+
+            if self._cancel.is_set():
+                return
 
             self._say_proc = _speak_async(result)
             self._say_proc.wait()
@@ -290,7 +308,7 @@ def _execute_bash_tool(command: str) -> str:
         return "Command timed out after 30 seconds."
 
 
-def _run_computer_use(request: str) -> str:
+def _run_computer_use(request: str, cancel: threading.Event | None = None) -> str:
     """Drive a Claude computer-use loop to fulfil the user's spoken request."""
     w, h = _get_screen_size()
     tools = [
@@ -305,6 +323,8 @@ def _run_computer_use(request: str) -> str:
     messages = [{"role": "user", "content": request}]
 
     for _ in range(20):  # safety cap on iterations
+        if cancel and cancel.is_set():
+            return "Cancelled."
         response = client.beta.messages.create(
             model="claude-sonnet-4-5",
             max_tokens=4096,
