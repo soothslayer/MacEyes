@@ -47,16 +47,18 @@ Grant them in **System Settings → Privacy & Security**.
 | Voice Action | Listens for a spoken command, then uses Claude to execute it |
 | Stop Speaking | Stops the current speech output |
 | Settings → Stop Hotkey | Change the global stop hotkey |
+| Settings → Voice Action Hotkey | Change the global Voice Action trigger hotkey |
 
 ## Hotkeys
 
 | Hotkey | Action |
 |---|---|
 | **Cmd+.** *(default)* | Stop speaking / cancel a running action immediately |
+| **Cmd+Shift+V** *(default)* | Trigger Voice Action |
 
-The stop hotkey works globally — you don't need the app to be focused. It stops speech and exits the computer-use loop as soon as the current API call completes.
+Both hotkeys work globally — you don't need the app to be focused. The stop hotkey exits the computer-use loop as soon as the current API call completes.
 
-To change it: **Settings → Stop Hotkey** in the menu bar. Use modifier names `cmd`, `ctrl`, `shift`, `alt` separated by `+`, followed by the key. Examples: `cmd+.`, `ctrl+shift+x`, `cmd+escape`. Settings are saved to `~/.maceyes.json`.
+To change either: **Settings → Stop Hotkey** or **Settings → Voice Action Hotkey** in the menu bar. Use modifier names `cmd`, `ctrl`, `shift`, `alt` separated by `+`, followed by the key. Examples: `cmd+.`, `ctrl+shift+x`, `cmd+escape`. Settings are saved to `~/.maceyes.json`.
 
 ## Notes
 
