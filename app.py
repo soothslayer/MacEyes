@@ -192,9 +192,13 @@ class MacEyesApp(rumps.App):
 
     def _on_stop_hotkey(self):
         """Stop speech and cancel any running action."""
+        if self._busy:
+            self.title = "🛑"
         self._cancel.set()
         if self._say_proc and self._say_proc.poll() is None:
             self._say_proc.terminate()
+        if self._busy:
+            _speak_async("Stopping")
 
     def _on_voice_action_hotkey(self):
         """Trigger Voice Action from the global hotkey."""
