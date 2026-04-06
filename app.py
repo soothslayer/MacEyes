@@ -112,6 +112,21 @@ class _Settings:
     @say_over.setter
     def say_over(self, value: bool):
         self._data["say_over"] = value
+    def computer_use_max_iterations(self) -> int:
+        return self._data.get("computer_use_max_iterations", 20)
+
+    @computer_use_max_iterations.setter
+    def computer_use_max_iterations(self, value: int):
+        self._data["computer_use_max_iterations"] = value
+        self._save()
+
+    @property
+    def computer_use_max_tokens(self) -> int:
+        return self._data.get("computer_use_max_tokens", 4096)
+
+    @computer_use_max_tokens.setter
+    def computer_use_max_tokens(self, value: int):
+        self._data["computer_use_max_tokens"] = value
         self._save()
 
 
@@ -260,11 +275,18 @@ class MacEyesApp(rumps.App):
         )
         self._say_over_item = rumps.MenuItem(
             self._say_over_menu_label(), callback=self.on_toggle_say_over
+        self._max_iterations_item = rumps.MenuItem(
+            self._max_iterations_menu_label(), callback=self.on_set_max_iterations
+        )
+        self._max_tokens_item = rumps.MenuItem(
+            self._max_tokens_menu_label(), callback=self.on_set_max_tokens
         )
         settings_menu.add(self._stop_hotkey_item)
         settings_menu.add(self._voice_hotkey_item)
         settings_menu.add(self._api_key_item)
         settings_menu.add(self._say_over_item)
+        settings_menu.add(self._max_iterations_item)
+        settings_menu.add(self._max_tokens_item)
 
         self.menu = [
             rumps.MenuItem("Describe Screen", callback=self.on_describe),
@@ -429,6 +451,55 @@ class MacEyesApp(rumps.App):
         if self._settings.say_over and not self._cancel.is_set():
             self._say_proc = _speak_async("over")
             self._say_proc.wait()
+    def _max_iterations_menu_label(self) -> str:
+        return f"Voice Action Max Iterations: {self._settings.computer_use_max_iterations}"
+
+    def _max_tokens_menu_label(self) -> str:
+        return f"Voice Action Max Tokens: {self._settings.computer_use_max_tokens}"
+
+    def on_set_max_iterations(self, _):
+        window = rumps.Window(
+            message="Max number of reasoning steps per Voice Action (default: 20). Lower = cheaper, higher = more capable.",
+            title="Set Max Iterations",
+            default_text=str(self._settings.computer_use_max_iterations),
+            ok="Save",
+            cancel="Cancel",
+            dimensions=(120, 24),
+        )
+        response = window.run()
+        if not response.clicked:
+            return
+        try:
+            value = int(response.text.strip())
+            if value < 1:
+                raise ValueError
+        except ValueError:
+            rumps.notification("MacEyes", "Invalid value", "Please enter a positive integer.")
+            return
+        self._settings.computer_use_max_iterations = value
+        self._max_iterations_item.title = self._max_iterations_menu_label()
+
+    def on_set_max_tokens(self, _):
+        window = rumps.Window(
+            message="Max tokens per Voice Action API call (default: 4096). Lower = cheaper, higher = allows longer responses.",
+            title="Set Max Tokens",
+            default_text=str(self._settings.computer_use_max_tokens),
+            ok="Save",
+            cancel="Cancel",
+            dimensions=(120, 24),
+        )
+        response = window.run()
+        if not response.clicked:
+            return
+        try:
+            value = int(response.text.strip())
+            if value < 1:
+                raise ValueError
+        except ValueError:
+            rumps.notification("MacEyes", "Invalid value", "Please enter a positive integer.")
+            return
+        self._settings.computer_use_max_tokens = value
+        self._max_tokens_item.title = self._max_tokens_menu_label()
 
     def _run(self, capture_fn=None):
         self._cancel.clear()
@@ -649,12 +720,14 @@ def _run_computer_use(request: str, cancel: threading.Event | None = None) -> st
     ]
     messages = [{"role": "user", "content": request}]
 
-    for _ in range(20):  # safety cap on iterations
+    max_iterations = _settings_instance.computer_use_max_iterations if "_settings_instance" in globals() else 20
+    max_tokens = _settings_instance.computer_use_max_tokens if "_settings_instance" in globals() else 4096
+    for _ in range(max_iterations):
         if cancel and cancel.is_set():
             return "Cancelled."
         response = _get_client().beta.messages.create(
             model="claude-sonnet-4-5",
-            max_tokens=4096,
+            max_tokens=max_tokens,
             system=VOICE_ACTION_SYSTEM,
             tools=tools,
             messages=messages,
@@ -696,6 +769,14 @@ def _run_computer_use(request: str, cancel: threading.Event | None = None) -> st
     return "Task loop reached maximum iterations. Stopping."
 
 
+def _downscale_screenshot(path: str, max_px: int = 1280) -> None:
+    """Resize image in-place so its longest side is at most max_px, using sips."""
+    subprocess.run(
+        ["sips", "-Z", str(max_px), path],
+        check=True, capture_output=True,
+    )
+
+
 def _capture_screen() -> str:
     """Capture the full screen and return a base64-encoded PNG."""
     fd, path = tempfile.mkstemp(suffix=".png")
@@ -703,6 +784,7 @@ def _capture_screen() -> str:
     try:
         # -x: no screenshot sound; -D 1: main display only
         subprocess.run(["screencapture", "-x", "-D", "1", path], check=True)
+        _downscale_screenshot(path)
         with open(path, "rb") as f:
             return base64.standard_b64encode(f.read()).decode()
     finally:
@@ -727,6 +809,7 @@ def _capture_active_window() -> str:
     os.close(fd)
     try:
         subprocess.run(["screencapture", "-x", "-l", str(window_id), path], check=True)
+        _downscale_screenshot(path)
         with open(path, "rb") as f:
             return base64.standard_b64encode(f.read()).decode()
     finally:
@@ -736,7 +819,7 @@ def _capture_active_window() -> str:
 def _describe(image_b64: str) -> str:
     """Send screenshot to Claude via vision and return a spoken description."""
     with _get_client().messages.stream(
-        model="claude-opus-4-6",
+        model="claude-haiku-4-5-20251001",
         max_tokens=512,
         system=SYSTEM_PROMPT,
         messages=[
