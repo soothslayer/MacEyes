@@ -60,6 +60,39 @@ Both hotkeys work globally — you don't need the app to be focused. The stop ho
 
 To change either: **Settings → Stop Hotkey** or **Settings → Voice Action Hotkey** in the menu bar. Use modifier names `cmd`, `ctrl`, `shift`, `alt` separated by `+`, followed by the key. Examples: `cmd+.`, `ctrl+shift+x`, `cmd+escape`. Settings are saved to `~/.maceyes.json`.
 
+## Building a DMG / PKG installer
+
+You can package MacEyes as a standalone `.app` (no Python required) and distribute it as a DMG or PKG.
+
+```bash
+# Build MacEyes.app + MacEyes.dmg
+./build_dmg.sh
+
+# Also create MacEyes.pkg (installs directly to /Applications)
+./build_dmg.sh --pkg
+```
+
+Finished artefacts land in `dist/`:
+
+| File | Description |
+|---|---|
+| `dist/MacEyes.app` | Standalone app bundle |
+| `dist/MacEyes.dmg` | Drag-to-Applications disk image |
+| `dist/MacEyes.pkg` | Flat installer (with `--pkg`) |
+
+**Requirements:** macOS with Xcode Command Line Tools (`xcode-select --install`), Python 3.11+, and Homebrew `flac` on Apple Silicon (`brew install flac`).
+
+**Code-signing:** To sign the app for distribution, set `DEVELOPER_ID` before running:
+```bash
+DEVELOPER_ID="Developer ID Application: Your Name (TEAMID)" ./build_dmg.sh
+```
+Without signing, users will need to right-click → Open on first launch, or run:
+```bash
+xattr -dr com.apple.quarantine /Applications/MacEyes.app
+```
+
+The bundled app has no Python dependency — the API key is entered via **Settings → API Key** in the menu bar after first launch.
+
 ## Notes
 
 - Voice Action uses Claude's computer-use API to take screenshots, click, type, scroll, and run shell commands on your behalf. Review what you're asking it to do — it has full control of your machine.
