@@ -474,12 +474,28 @@ class MacEyesApp(rumps.App):
     def _run_voice_action(self):
         self._cancel.clear()
         try:
-            self._speak("Listening. Say your command.")
+            # Start TTS and mic warm-up concurrently so the mic is ready the
+            # instant the user hears "Over." (or the prompt ends).
+            self._say_proc = _speak_async("Listening. Say your command.")
+            recognizer = sr.Recognizer()
+            mic = sr.Microphone()
+            source = mic.__enter__()
+            recognizer.adjust_for_ambient_noise(source, duration=0.5)
+
+            # Finish TTS (+ optional "over") before we start capturing.
+            self._say_proc.wait()
+            if self._settings.say_over and not self._cancel.is_set():
+                self._say_proc = _speak_async("over")
+                self._say_proc.wait()
+
+            # Brief pause so the audio buffer fully drains before we listen.
+            time.sleep(0.15)
 
             if self._cancel.is_set():
+                mic.__exit__(None, None, None)
                 return
 
-            command = _listen_for_command()
+            command = _listen_for_command(pre_warmed=(recognizer, mic, source))
             command = _resolve_app_names(command)
 
             self._speak(f"Got it. {command}. Working on it.")
@@ -564,12 +580,24 @@ class _WorkingTones:
         return b"".join(frames)
 
 
-def _listen_for_command() -> str:
-    """Record from the microphone and return transcribed text."""
-    recognizer = sr.Recognizer()
-    with sr.Microphone() as source:
-        recognizer.adjust_for_ambient_noise(source, duration=0.5)
-        audio = recognizer.listen(source, timeout=10, phrase_time_limit=15)
+def _listen_for_command(pre_warmed: tuple | None = None) -> str:
+    """Record from the microphone and return transcribed text.
+
+    If *pre_warmed* is supplied it should be a (recognizer, mic, source) tuple
+    whose ambient-noise calibration has already been performed while TTS was
+    playing, so we can start capturing immediately.
+    """
+    if pre_warmed is not None:
+        recognizer, mic, source = pre_warmed
+        try:
+            audio = recognizer.listen(source, timeout=10, phrase_time_limit=15)
+        finally:
+            mic.__exit__(None, None, None)
+    else:
+        recognizer = sr.Recognizer()
+        with sr.Microphone() as source:
+            recognizer.adjust_for_ambient_noise(source, duration=0.5)
+            audio = recognizer.listen(source, timeout=10, phrase_time_limit=15)
     return recognizer.recognize_google(audio)
 
 
