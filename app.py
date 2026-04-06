@@ -7,6 +7,7 @@ import difflib
 import json
 import math
 import os
+import plistlib
 import re
 import struct
 import subprocess
@@ -53,6 +54,47 @@ VOICE_ACTION_SYSTEM = (
 _SETTINGS_PATH = os.path.expanduser("~/.maceyes.json")
 _DEFAULT_STOP_HOTKEY = "cmd+."
 _DEFAULT_VOICE_ACTION_HOTKEY = "cmd+shift+v"
+
+_LAUNCH_AGENT_LABEL = "com.maceyes.app"
+_LAUNCH_AGENT_PLIST = os.path.expanduser(
+    f"~/Library/LaunchAgents/{_LAUNCH_AGENT_LABEL}.plist"
+)
+
+
+def _launch_at_login_enabled() -> bool:
+    """Return True if the LaunchAgent plist currently exists."""
+    return os.path.exists(_LAUNCH_AGENT_PLIST)
+
+
+def _set_launch_at_login(enabled: bool) -> None:
+    """Create or remove the LaunchAgent plist to enable/disable launch at login."""
+    if enabled:
+        os.makedirs(os.path.dirname(_LAUNCH_AGENT_PLIST), exist_ok=True)
+        # Detect whether we're running inside a py2app .app bundle
+        if getattr(sys, "frozen", False):
+            # py2app sets sys.frozen and packages a standalone executable
+            program_args = [sys.executable]
+        else:
+            program_args = [sys.executable, os.path.abspath(__file__)]
+        plist_data = {
+            "Label": _LAUNCH_AGENT_LABEL,
+            "ProgramArguments": program_args,
+            "RunAtLoad": True,
+            "KeepAlive": False,
+        }
+        with open(_LAUNCH_AGENT_PLIST, "wb") as f:
+            plistlib.dump(plist_data, f)
+        subprocess.run(
+            ["launchctl", "load", _LAUNCH_AGENT_PLIST],
+            capture_output=True,
+        )
+    else:
+        if os.path.exists(_LAUNCH_AGENT_PLIST):
+            subprocess.run(
+                ["launchctl", "unload", _LAUNCH_AGENT_PLIST],
+                capture_output=True,
+            )
+            os.remove(_LAUNCH_AGENT_PLIST)
 
 
 class _Settings:
@@ -297,6 +339,9 @@ class MacEyesApp(rumps.App):
         self._max_tokens_item = rumps.MenuItem(
             self._max_tokens_menu_label(), callback=self.on_set_max_tokens
         )
+        self._launch_at_login_item = rumps.MenuItem(
+            self._launch_at_login_menu_label(), callback=self.on_toggle_launch_at_login
+        )
         settings_menu.add(self._stop_hotkey_item)
         settings_menu.add(self._voice_hotkey_item)
         settings_menu.add(self._api_key_item)
@@ -304,6 +349,7 @@ class MacEyesApp(rumps.App):
         settings_menu.add(self._computer_use_model_item)
         settings_menu.add(self._max_iterations_item)
         settings_menu.add(self._max_tokens_item)
+        settings_menu.add(self._launch_at_login_item)
 
         self.menu = [
             rumps.MenuItem("Describe Screen", callback=self.on_describe),
@@ -507,6 +553,18 @@ class MacEyesApp(rumps.App):
             return
         self._settings.computer_use_max_iterations = value
         self._max_iterations_item.title = self._max_iterations_menu_label()
+
+    def _launch_at_login_menu_label(self) -> str:
+        return "Start on Login: On" if _launch_at_login_enabled() else "Start on Login: Off"
+
+    def on_toggle_launch_at_login(self, _):
+        enabled = not _launch_at_login_enabled()
+        try:
+            _set_launch_at_login(enabled)
+        except Exception as exc:
+            rumps.alert(title="Launch at Login Error", message=str(exc))
+            return
+        self._launch_at_login_item.title = self._launch_at_login_menu_label()
 
     def on_set_max_tokens(self, _):
         window = rumps.Window(
