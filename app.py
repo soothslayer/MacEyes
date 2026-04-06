@@ -55,6 +55,21 @@ _SETTINGS_PATH = os.path.expanduser("~/.maceyes.json")
 _DEFAULT_STOP_HOTKEY = "cmd+."
 _DEFAULT_VOICE_ACTION_HOTKEY = "cmd+shift+v"
 
+_VERSION = "1.1.0"
+_CHANGELOG = """\
+v1.1.0
+• Start on Login setting (LaunchAgent)
+
+v1.0.0
+• Describe Screen and Describe Active Window
+• Voice Action with computer-use automation
+• Configurable hotkeys and API key storage
+• Tunable Voice Action limits (iterations, tokens)
+• Toggleable action model (Haiku / Sonnet)
+• Say "Over" when done option
+• Processing tones and stop-hotkey feedback\
+"""
+
 _LAUNCH_AGENT_LABEL = "com.maceyes.app"
 _LAUNCH_AGENT_PLIST = os.path.expanduser(
     f"~/Library/LaunchAgents/{_LAUNCH_AGENT_LABEL}.plist"
@@ -358,6 +373,7 @@ class MacEyesApp(rumps.App):
             rumps.MenuItem("Stop Speaking", callback=self.on_stop),
             None,  # separator
             settings_menu,
+            rumps.MenuItem(f"About MacEyes {_VERSION}", callback=self.on_about),
         ]
         self._busy = False
         self._say_proc: subprocess.Popen | None = None
@@ -395,6 +411,13 @@ class MacEyesApp(rumps.App):
     @rumps.clicked("Stop Speaking")
     def on_stop(self, _):
         self._on_stop_hotkey()
+
+    def on_about(self, _):
+        rumps.alert(
+            title=f"MacEyes {_VERSION}",
+            message=_CHANGELOG,
+            ok="OK",
+        )
 
     def _on_stop_hotkey(self):
         """Stop speech and cancel any running action. Called from pynput's thread."""
