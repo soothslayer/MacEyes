@@ -112,12 +112,24 @@ class _Settings:
     @say_over.setter
     def say_over(self, value: bool):
         self._data["say_over"] = value
+        self._save()
+
+    @property
     def computer_use_max_iterations(self) -> int:
         return self._data.get("computer_use_max_iterations", 20)
 
     @computer_use_max_iterations.setter
     def computer_use_max_iterations(self, value: int):
         self._data["computer_use_max_iterations"] = value
+        self._save()
+
+    @property
+    def computer_use_model(self) -> str:
+        return self._data.get("computer_use_model", "claude-haiku-4-5-20251001")
+
+    @computer_use_model.setter
+    def computer_use_model(self, value: str):
+        self._data["computer_use_model"] = value
         self._save()
 
     @property
@@ -275,6 +287,10 @@ class MacEyesApp(rumps.App):
         )
         self._say_over_item = rumps.MenuItem(
             self._say_over_menu_label(), callback=self.on_toggle_say_over
+        )
+        self._computer_use_model_item = rumps.MenuItem(
+            self._computer_use_model_menu_label(), callback=self.on_toggle_computer_use_model
+        )
         self._max_iterations_item = rumps.MenuItem(
             self._max_iterations_menu_label(), callback=self.on_set_max_iterations
         )
@@ -285,6 +301,7 @@ class MacEyesApp(rumps.App):
         settings_menu.add(self._voice_hotkey_item)
         settings_menu.add(self._api_key_item)
         settings_menu.add(self._say_over_item)
+        settings_menu.add(self._computer_use_model_item)
         settings_menu.add(self._max_iterations_item)
         settings_menu.add(self._max_tokens_item)
 
@@ -443,6 +460,18 @@ class MacEyesApp(rumps.App):
     def on_toggle_say_over(self, _):
         self._settings.say_over = not self._settings.say_over
         self._say_over_item.title = self._say_over_menu_label()
+
+    def _computer_use_model_menu_label(self) -> str:
+        model = self._settings.computer_use_model
+        label = "Sonnet" if "sonnet" in model else "Haiku"
+        return f"Action Model: {label}"
+
+    def on_toggle_computer_use_model(self, _):
+        if "haiku" in self._settings.computer_use_model:
+            self._settings.computer_use_model = "claude-sonnet-4-5"
+        else:
+            self._settings.computer_use_model = "claude-haiku-4-5-20251001"
+        self._computer_use_model_item.title = self._computer_use_model_menu_label()
 
     def _speak(self, text: str) -> None:
         """Speak text, then say 'over' if that setting is enabled and not cancelled."""
@@ -726,7 +755,7 @@ def _run_computer_use(request: str, cancel: threading.Event | None = None) -> st
         if cancel and cancel.is_set():
             return "Cancelled."
         response = _get_client().beta.messages.create(
-            model="claude-sonnet-4-5",
+            model=_settings_instance.computer_use_model if "_settings_instance" in globals() else "claude-haiku-4-5-20251001",
             max_tokens=max_tokens,
             system=VOICE_ACTION_SYSTEM,
             tools=tools,
