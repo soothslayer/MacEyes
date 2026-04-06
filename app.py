@@ -105,6 +105,15 @@ class _Settings:
             self._data.pop("api_key", None)
         self._save()
 
+    @property
+    def say_over(self) -> bool:
+        return self._data.get("say_over", False)
+
+    @say_over.setter
+    def say_over(self, value: bool):
+        self._data["say_over"] = value
+        self._save()
+
 
 _app_cache: list[str] = []
 _app_cache_lock = threading.Lock()
@@ -249,9 +258,13 @@ class MacEyesApp(rumps.App):
         self._api_key_item = rumps.MenuItem(
             self._api_key_menu_label(), callback=self.on_set_api_key
         )
+        self._say_over_item = rumps.MenuItem(
+            self._say_over_menu_label(), callback=self.on_toggle_say_over
+        )
         settings_menu.add(self._stop_hotkey_item)
         settings_menu.add(self._voice_hotkey_item)
         settings_menu.add(self._api_key_item)
+        settings_menu.add(self._say_over_item)
 
         self.menu = [
             rumps.MenuItem("Describe Screen", callback=self.on_describe),
@@ -299,14 +312,25 @@ class MacEyesApp(rumps.App):
         self._on_stop_hotkey()
 
     def _on_stop_hotkey(self):
-        """Stop speech and cancel any running action."""
-        if self._busy:
-            self.title = "🛑"
-        self._cancel.set()
-        if self._say_proc and self._say_proc.poll() is None:
-            self._say_proc.terminate()
-        if self._busy:
-            _speak_async("Stopping")
+        """Stop speech and cancel any running action. Called from pynput's thread."""
+        # TODO: pressing stop while _speak() is mid-utterance (e.g. "Say your command")
+        # still crashes intermittently. The root cause appears to be a race between
+        # terminating self._say_proc here and _speak() starting the "over" process
+        # on the voice-action thread — likely a PyAudio/sr teardown issue. Needs
+        # investigation with crash logs to pinpoint the exact fault.
+        try:
+            self._cancel.set()
+            if self._say_proc and self._say_proc.poll() is None:
+                self._say_proc.terminate()
+            if self._busy:
+                # Title update must happen on the main thread — dispatch via NSOperationQueue
+                from Foundation import NSOperationQueue
+                NSOperationQueue.mainQueue().addOperationWithBlock_(
+                    lambda: setattr(self, "title", "🛑")
+                )
+                _speak_async("Stopping")
+        except Exception:
+            pass
 
     def _on_voice_action_hotkey(self):
         """Trigger Voice Action from the global hotkey."""
@@ -391,14 +415,33 @@ class MacEyesApp(rumps.App):
         self._settings.api_key = value if value else None
         self._api_key_item.title = self._api_key_menu_label()
 
+    def _say_over_menu_label(self) -> str:
+        return "Say 'Over' When Done: On" if self._settings.say_over else "Say 'Over' When Done: Off"
+
+    def on_toggle_say_over(self, _):
+        self._settings.say_over = not self._settings.say_over
+        self._say_over_item.title = self._say_over_menu_label()
+
+    def _speak(self, text: str) -> None:
+        """Speak text, then say 'over' if that setting is enabled and not cancelled."""
+        self._say_proc = _speak_async(text)
+        self._say_proc.wait()
+        if self._settings.say_over and not self._cancel.is_set():
+            self._say_proc = _speak_async("over")
+            self._say_proc.wait()
+
     def _run(self, capture_fn=None):
         self._cancel.clear()
         try:
             _speak_async("Analyzing screen...").wait()
-            img = (capture_fn or _capture_screen)()
-            desc = _describe(img)
-            self._say_proc = _speak_async(desc)
-            self._say_proc.wait()
+            tones = _WorkingTones()
+            tones.start()
+            try:
+                img = (capture_fn or _capture_screen)()
+                desc = _describe(img)
+            finally:
+                tones.stop()
+            self._speak(desc)
         except Exception as exc:
             traceback.print_exc(file=sys.stderr)
             rumps.notification("MacEyes", "Error", str(exc))
@@ -409,14 +452,15 @@ class MacEyesApp(rumps.App):
     def _run_voice_action(self):
         self._cancel.clear()
         try:
-            self._say_proc = _speak_async("Listening. Say your command.")
-            self._say_proc.wait()
+            self._speak("Listening. Say your command.")
+
+            if self._cancel.is_set():
+                return
 
             command = _listen_for_command()
             command = _resolve_app_names(command)
 
-            self._say_proc = _speak_async(f"Got it. {command}. Working on it.")
-            self._say_proc.wait()
+            self._speak(f"Got it. {command}. Working on it.")
 
             tones = _WorkingTones()
             tones.start()
@@ -428,12 +472,11 @@ class MacEyesApp(rumps.App):
             if self._cancel.is_set():
                 return
 
-            self._say_proc = _speak_async(result)
-            self._say_proc.wait()
+            self._speak(result)
         except sr.WaitTimeoutError:
-            _speak_async("No speech detected. Please try again.").wait()
+            self._speak("No speech detected. Please try again.")
         except sr.UnknownValueError:
-            _speak_async("Sorry, I couldn't understand that. Please try again.").wait()
+            self._speak("Sorry, I couldn't understand that. Please try again.")
         except Exception as exc:
             traceback.print_exc(file=sys.stderr)
             rumps.notification("MacEyes", "Voice Action Error", str(exc))
