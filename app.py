@@ -114,6 +114,16 @@ class _Settings:
         self._data["say_over"] = value
         self._save()
 
+    @property
+    def powerful_computer_use(self) -> bool:
+        """Use claude-sonnet-4-6 instead of Haiku for computer use tasks."""
+        return self._data.get("powerful_computer_use", False)
+
+    @powerful_computer_use.setter
+    def powerful_computer_use(self, value: bool):
+        self._data["powerful_computer_use"] = value
+        self._save()
+
 
 _app_cache: list[str] = []
 _app_cache_lock = threading.Lock()
@@ -261,10 +271,14 @@ class MacEyesApp(rumps.App):
         self._say_over_item = rumps.MenuItem(
             self._say_over_menu_label(), callback=self.on_toggle_say_over
         )
+        self._powerful_cu_item = rumps.MenuItem(
+            self._powerful_cu_menu_label(), callback=self.on_toggle_powerful_cu
+        )
         settings_menu.add(self._stop_hotkey_item)
         settings_menu.add(self._voice_hotkey_item)
         settings_menu.add(self._api_key_item)
         settings_menu.add(self._say_over_item)
+        settings_menu.add(self._powerful_cu_item)
 
         self.menu = [
             rumps.MenuItem("Describe Screen", callback=self.on_describe),
@@ -421,6 +435,14 @@ class MacEyesApp(rumps.App):
     def on_toggle_say_over(self, _):
         self._settings.say_over = not self._settings.say_over
         self._say_over_item.title = self._say_over_menu_label()
+
+    def _powerful_cu_menu_label(self) -> str:
+        model = "Sonnet" if self._settings.powerful_computer_use else "Haiku"
+        return f"Voice Action Model: {model}"
+
+    def on_toggle_powerful_cu(self, _):
+        self._settings.powerful_computer_use = not self._settings.powerful_computer_use
+        self._powerful_cu_item.title = self._powerful_cu_menu_label()
 
     def _speak(self, text: str) -> None:
         """Speak text, then say 'over' if that setting is enabled and not cancelled."""
@@ -635,6 +657,10 @@ def _execute_bash_tool(command: str) -> str:
         return "Command timed out after 30 seconds."
 
 
+_COMPUTER_USE_MODEL_HAIKU = "claude-haiku-4-5-20251001"
+_COMPUTER_USE_MODEL_SONNET = "claude-sonnet-4-6"
+
+
 def _run_computer_use(request: str, cancel: threading.Event | None = None) -> str:
     """Drive a Claude computer-use loop to fulfil the user's spoken request."""
     w, h = _get_screen_size()
@@ -652,8 +678,13 @@ def _run_computer_use(request: str, cancel: threading.Event | None = None) -> st
     for _ in range(20):  # safety cap on iterations
         if cancel and cancel.is_set():
             return "Cancelled."
+        cu_model = (
+            _COMPUTER_USE_MODEL_SONNET
+            if ("_settings_instance" in globals() and _settings_instance.powerful_computer_use)
+            else _COMPUTER_USE_MODEL_HAIKU
+        )
         response = _get_client().beta.messages.create(
-            model="claude-sonnet-4-5",
+            model=cu_model,
             max_tokens=4096,
             system=VOICE_ACTION_SYSTEM,
             tools=tools,
@@ -696,6 +727,23 @@ def _run_computer_use(request: str, cancel: threading.Event | None = None) -> st
     return "Task loop reached maximum iterations. Stopping."
 
 
+_MAX_SCREENSHOT_WIDTH = 1280
+
+
+def _resize_and_encode(path: str) -> str:
+    """Resize image to at most _MAX_SCREENSHOT_WIDTH wide and return base64 PNG."""
+    from PIL import Image
+    import io
+    with Image.open(path) as img:
+        w, h = img.size
+        if w > _MAX_SCREENSHOT_WIDTH:
+            new_h = int(h * _MAX_SCREENSHOT_WIDTH / w)
+            img = img.resize((_MAX_SCREENSHOT_WIDTH, new_h), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return base64.standard_b64encode(buf.getvalue()).decode()
+
+
 def _capture_screen() -> str:
     """Capture the full screen and return a base64-encoded PNG."""
     fd, path = tempfile.mkstemp(suffix=".png")
@@ -703,8 +751,7 @@ def _capture_screen() -> str:
     try:
         # -x: no screenshot sound; -D 1: main display only
         subprocess.run(["screencapture", "-x", "-D", "1", path], check=True)
-        with open(path, "rb") as f:
-            return base64.standard_b64encode(f.read()).decode()
+        return _resize_and_encode(path)
     finally:
         os.unlink(path)
 
@@ -727,8 +774,7 @@ def _capture_active_window() -> str:
     os.close(fd)
     try:
         subprocess.run(["screencapture", "-x", "-l", str(window_id), path], check=True)
-        with open(path, "rb") as f:
-            return base64.standard_b64encode(f.read()).decode()
+        return _resize_and_encode(path)
     finally:
         os.unlink(path)
 
@@ -736,7 +782,7 @@ def _capture_active_window() -> str:
 def _describe(image_b64: str) -> str:
     """Send screenshot to Claude via vision and return a spoken description."""
     with _get_client().messages.stream(
-        model="claude-opus-4-6",
+        model="claude-haiku-4-5-20251001",
         max_tokens=512,
         system=SYSTEM_PROMPT,
         messages=[
