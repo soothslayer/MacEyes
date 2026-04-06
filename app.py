@@ -3,14 +3,17 @@
 
 import anthropic
 import base64
+import difflib
 import json
 import math
 import os
+import re
 import struct
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import traceback
 
 import Quartz
@@ -22,7 +25,10 @@ from pynput import keyboard
 pyautogui.PAUSE = 0.1
 pyautogui.FAILSAFE = False
 
-client = anthropic.Anthropic()
+def _get_client() -> anthropic.Anthropic:
+    """Return an Anthropic client, preferring the key stored in settings."""
+    key = _settings_instance.api_key if "_settings_instance" in globals() else None
+    return anthropic.Anthropic(api_key=key) if key else anthropic.Anthropic()
 
 SYSTEM_PROMPT = (
     "You are an accessibility assistant helping a visually impaired user understand "
@@ -87,6 +93,99 @@ class _Settings:
         self._data["voice_action_hotkey"] = value
         self._save()
 
+    @property
+    def api_key(self) -> str | None:
+        return self._data.get("api_key") or None
+
+    @api_key.setter
+    def api_key(self, value: str | None):
+        if value:
+            self._data["api_key"] = value
+        else:
+            self._data.pop("api_key", None)
+        self._save()
+
+
+_app_cache: list[str] = []
+_app_cache_lock = threading.Lock()
+
+
+def _refresh_app_list() -> None:
+    """Fetch installed .app bundle names via Spotlight and update the cache."""
+    try:
+        result = subprocess.run(
+            ["mdfind", "kMDItemContentType == 'com.apple.application-bundle'"],
+            capture_output=True, text=True, timeout=15,
+        )
+        apps = []
+        for path in result.stdout.splitlines():
+            name = os.path.basename(path)
+            if name.endswith(".app"):
+                apps.append(name[:-4])
+        with _app_cache_lock:
+            global _app_cache
+            _app_cache = sorted(set(apps))
+        print(f"[MacEyes] App cache refreshed: {len(_app_cache)} apps", file=sys.stderr)
+    except Exception as exc:
+        print(f"[MacEyes] App cache refresh failed: {exc}", file=sys.stderr)
+
+
+def _start_app_cache_refresher() -> None:
+    """Start a daemon thread that refreshes the app list immediately and every 15 minutes."""
+    def _loop():
+        while True:
+            _refresh_app_list()
+            time.sleep(15 * 60)
+    threading.Thread(target=_loop, daemon=True, name="app-cache-refresher").start()
+
+
+def _normalize_app_name(s: str) -> str:
+    """Lowercase and strip non-alphanumeric characters for fuzzy comparison."""
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def _resolve_app_names(command: str) -> str:
+    """Replace misrecognized app names in the spoken command with known app names.
+
+    Tries every 1-to-4-word n-gram in the command and substitutes the highest-scoring
+    match from the installed app cache when similarity exceeds the threshold.
+    """
+    with _app_cache_lock:
+        apps = list(_app_cache)
+    if not apps:
+        return command
+
+    norm_to_app = {_normalize_app_name(app): app for app in apps}
+    words = command.split()
+
+    best_score = 0.80  # minimum similarity to accept a substitution
+    best_app: str | None = None
+    best_span: tuple[int, int] | None = None
+
+    for n in range(1, 5):
+        for i in range(len(words) - n + 1):
+            phrase = " ".join(words[i : i + n])
+            norm_phrase = _normalize_app_name(phrase)
+            for norm_app, original_app in norm_to_app.items():
+                score = difflib.SequenceMatcher(None, norm_phrase, norm_app).ratio()
+                if score > best_score:
+                    best_score = score
+                    best_app = original_app
+                    best_span = (i, i + n)
+
+    if best_app and best_span:
+        start, end = best_span
+        resolved = " ".join(words[:start] + [best_app] + words[end:])
+        if resolved != command:
+            print(
+                f"[MacEyes] App name resolved: '{command}' -> '{resolved}' "
+                f"(score={best_score:.2f})",
+                file=sys.stderr,
+            )
+        return resolved
+
+    return command
+
 
 _KEY_ALIASES = {
     "option": "alt",
@@ -137,6 +236,9 @@ class MacEyesApp(rumps.App):
         super().__init__("👁", quit_button="Quit MacEyes")
         self._settings = _Settings()
 
+        global _settings_instance
+        _settings_instance = self._settings
+
         settings_menu = rumps.MenuItem("Settings")
         self._stop_hotkey_item = rumps.MenuItem(
             self._stop_hotkey_menu_label(), callback=self.on_set_stop_hotkey
@@ -144,8 +246,12 @@ class MacEyesApp(rumps.App):
         self._voice_hotkey_item = rumps.MenuItem(
             self._voice_hotkey_menu_label(), callback=self.on_set_voice_hotkey
         )
+        self._api_key_item = rumps.MenuItem(
+            self._api_key_menu_label(), callback=self.on_set_api_key
+        )
         settings_menu.add(self._stop_hotkey_item)
         settings_menu.add(self._voice_hotkey_item)
+        settings_menu.add(self._api_key_item)
 
         self.menu = [
             rumps.MenuItem("Describe Screen", callback=self.on_describe),
@@ -161,6 +267,8 @@ class MacEyesApp(rumps.App):
 
         self._hotkey_listener = self._build_hotkey_listener()
         self._hotkey_listener.start()
+
+        _start_app_cache_refresher()
 
     @rumps.clicked("Describe Screen")
     def on_describe(self, _):
@@ -263,6 +371,26 @@ class MacEyesApp(rumps.App):
         self._hotkey_listener.start()
         self._voice_hotkey_item.title = self._voice_hotkey_menu_label()
 
+    def _api_key_menu_label(self) -> str:
+        return "API Key: (set)" if self._settings.api_key else "API Key: (using env)"
+
+    def on_set_api_key(self, _):
+        current = self._settings.api_key or ""
+        window = rumps.Window(
+            message="Paste your Anthropic API key below. Leave blank to clear and fall back to the ANTHROPIC_API_KEY environment variable.",
+            title="Set Anthropic API Key",
+            default_text=current,
+            ok="Save",
+            cancel="Cancel",
+            dimensions=(380, 24),
+        )
+        response = window.run()
+        if not response.clicked:
+            return
+        value = response.text.strip()
+        self._settings.api_key = value if value else None
+        self._api_key_item.title = self._api_key_menu_label()
+
     def _run(self, capture_fn=None):
         self._cancel.clear()
         try:
@@ -285,6 +413,7 @@ class MacEyesApp(rumps.App):
             self._say_proc.wait()
 
             command = _listen_for_command()
+            command = _resolve_app_names(command)
 
             self._say_proc = _speak_async(f"Got it. {command}. Working on it.")
             self._say_proc.wait()
@@ -480,7 +609,7 @@ def _run_computer_use(request: str, cancel: threading.Event | None = None) -> st
     for _ in range(20):  # safety cap on iterations
         if cancel and cancel.is_set():
             return "Cancelled."
-        response = client.beta.messages.create(
+        response = _get_client().beta.messages.create(
             model="claude-sonnet-4-5",
             max_tokens=4096,
             system=VOICE_ACTION_SYSTEM,
@@ -563,7 +692,7 @@ def _capture_active_window() -> str:
 
 def _describe(image_b64: str) -> str:
     """Send screenshot to Claude via vision and return a spoken description."""
-    with client.messages.stream(
+    with _get_client().messages.stream(
         model="claude-opus-4-6",
         max_tokens=512,
         system=SYSTEM_PROMPT,
