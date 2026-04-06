@@ -3,6 +3,7 @@
 
 import anthropic
 import base64
+import json
 import os
 import subprocess
 import tempfile
@@ -16,7 +17,35 @@ import speech_recognition as sr
 pyautogui.PAUSE = 0.1
 pyautogui.FAILSAFE = False
 
-client = anthropic.Anthropic()
+CONFIG_PATH = os.path.expanduser("~/.config/maceyes/config.json")
+
+
+def _load_config() -> dict:
+    if os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH) as f:
+            return json.load(f)
+    return {}
+
+
+def _save_config(config: dict) -> None:
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(config, f, indent=2)
+
+
+def _make_client() -> anthropic.Anthropic:
+    """Build an Anthropic client from saved config or environment variables."""
+    config = _load_config()
+    auth_type = config.get("auth_type", "api_key")
+    if auth_type == "auth_token" and config.get("auth_token"):
+        return anthropic.Anthropic(auth_token=config["auth_token"])
+    if config.get("api_key"):
+        return anthropic.Anthropic(api_key=config["api_key"])
+    # Fall back to ANTHROPIC_API_KEY env var (default SDK behaviour)
+    return anthropic.Anthropic()
+
+
+client = _make_client()
 
 SYSTEM_PROMPT = (
     "You are an accessibility assistant helping a visually impaired user understand "
@@ -58,9 +87,13 @@ class MacEyesApp(rumps.App):
             rumps.MenuItem("Describe Active Window", callback=self.on_describe_window),
             rumps.MenuItem("Voice Action", callback=self.on_voice_action),
             rumps.MenuItem("Stop Speaking", callback=self.on_stop),
+            None,  # separator
+            rumps.MenuItem("Set API Key…", callback=self.on_set_api_key),
+            rumps.MenuItem("Set Auth Token…", callback=self.on_set_auth_token),
         ]
         self._busy = False
         self._say_proc: subprocess.Popen | None = None
+        self._update_auth_checkmarks()
 
     @rumps.clicked("Describe Screen")
     def on_describe(self, _):
@@ -90,6 +123,57 @@ class MacEyesApp(rumps.App):
     def on_stop(self, _):
         if self._say_proc and self._say_proc.poll() is None:
             self._say_proc.terminate()
+
+    @rumps.clicked("Set API Key…")
+    def on_set_api_key(self, _):
+        config = _load_config()
+        current = config.get("api_key", "")
+        win = rumps.Window(
+            message="Enter your Anthropic API key (sk-ant-…):",
+            title="MacEyes — Set API Key",
+            default_text=current,
+            ok="Save",
+            cancel="Cancel",
+            dimensions=(420, 24),
+        )
+        response = win.run()
+        if response.clicked and response.text.strip():
+            config["api_key"] = response.text.strip()
+            config["auth_type"] = "api_key"
+            _save_config(config)
+            global client
+            client = _make_client()
+            self._update_auth_checkmarks()
+            rumps.notification("MacEyes", "Auth", "API key saved and active.")
+
+    @rumps.clicked("Set Auth Token…")
+    def on_set_auth_token(self, _):
+        config = _load_config()
+        current = config.get("auth_token", "")
+        win = rumps.Window(
+            message="Enter your Anthropic OAuth auth token:",
+            title="MacEyes — Set Auth Token",
+            default_text=current,
+            ok="Save",
+            cancel="Cancel",
+            dimensions=(420, 24),
+        )
+        response = win.run()
+        if response.clicked and response.text.strip():
+            config["auth_token"] = response.text.strip()
+            config["auth_type"] = "auth_token"
+            _save_config(config)
+            global client
+            client = _make_client()
+            self._update_auth_checkmarks()
+            rumps.notification("MacEyes", "Auth", "Auth token saved and active.")
+
+    def _update_auth_checkmarks(self):
+        """Show a checkmark next to whichever auth method is currently active."""
+        config = _load_config()
+        auth_type = config.get("auth_type", "api_key")
+        self.menu["Set API Key…"].state = auth_type == "api_key" and bool(config.get("api_key"))
+        self.menu["Set Auth Token…"].state = auth_type == "auth_token" and bool(config.get("auth_token"))
 
     def _run(self, capture_fn=None):
         try:
