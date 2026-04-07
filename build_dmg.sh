@@ -81,6 +81,15 @@ fi
 info "Cleaning previous build artefacts…"
 rm -rf build dist
 
+# ── Fix rubicon namespace package for py2app ──────────────────────────────────
+# rubicon-objc is a PEP 420 namespace package (no __init__.py) which py2app's
+# modulegraph cannot locate via imp.find_module.  A stub fixes the lookup.
+RUBICON_INIT="venv/lib/$(ls venv/lib)/site-packages/rubicon/__init__.py"
+if [[ ! -f "$RUBICON_INIT" ]]; then
+  echo "# stub created by build_dmg.sh to make rubicon visible to py2app/modulegraph" > "$RUBICON_INIT"
+  ok "Created rubicon stub __init__.py for py2app compatibility."
+fi
+
 # ── Build .app bundle ─────────────────────────────────────────────────────────
 info "Building ${APP_NAME}.app with py2app (this takes a few minutes)…"
 python setup.py py2app 2>&1

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """MacEyes — AI-powered screen description via voice."""
 
+from __future__ import annotations
+
 import anthropic
 import base64
 import difflib
