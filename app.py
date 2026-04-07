@@ -894,8 +894,8 @@ def _capture_screen() -> str:
     fd, path = tempfile.mkstemp(suffix=".png")
     os.close(fd)
     try:
-        # -x: no screenshot sound; -D 1: main display only
-        subprocess.run(["screencapture", "-x", "-D", "1", path], check=True)
+        # -x: no screenshot sound
+        subprocess.run(["screencapture", "-x", path], check=True)
         _downscale_screenshot(path)
         with open(path, "rb") as f:
             return base64.standard_b64encode(f.read()).decode()
